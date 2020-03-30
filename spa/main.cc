@@ -23,10 +23,11 @@ T NormalizeAngleDifference(T difference) {
 }
 class SpaCostFunctor {
  public:
-  SpaCostFunctor(const Pose& observed)
+  SpaCostFunctor(const Pose& observed, const Eigen::Matrix3d& sqrt_information)
       : x_(observed.translation.x()),
         y_(observed.translation.y()),
-        theta_(observed.rotation.angle()) {}
+        theta_(observed.rotation.angle()),
+        sqrt_information_(sqrt_information) {}
   ~SpaCostFunctor() {}
 
   template <typename T>
@@ -38,10 +39,15 @@ class SpaCostFunctor {
     const T source_sin = sin(*source_theta);
     const T delta_x = *target_x - *source_x;
     const T delta_y = *target_y - *source_y;
-    residual[0] = x_ - (source_cos * delta_x + source_sin * delta_y);
-    residual[1] = y_ - (source_cos * delta_y - source_sin * delta_x);
-    residual[2] =
-        NormalizeAngleDifference(theta_ - (*target_theta - *source_theta));
+    Eigen::Map<Eigen::Matrix<T, 3, 1>> residual_map(residual);
+    residual_map(0) =
+        static_cast<T>(x_) - (source_cos * delta_x + source_sin * delta_y);
+    residual_map(1) =
+        static_cast<T>(y_) - (source_cos * delta_y - source_sin * delta_x);
+    residual_map(2) = NormalizeAngleDifference(static_cast<T>(theta_) -
+                                               (*target_theta - *source_theta));
+
+    residual_map = sqrt_information_.template cast<T>() * residual_map;
     return true;
   }
 
@@ -49,6 +55,7 @@ class SpaCostFunctor {
   const double x_;
   const double y_;
   const double theta_;
+  const Eigen::Matrix3d& sqrt_information_;
 };
 
 class SpaCostFunctorAnalytic
@@ -69,18 +76,13 @@ class SpaCostFunctorAnalytic
     const double dx = parameters[3][0] - parameters[0][0];
     const double dy = parameters[4][0] - parameters[1][0];
 
-    Eigen::Vector3d unweighted_residual;
-    unweighted_residual.x() =
-        x_ - (cos_source_theta * dx + sin_source_theta * dy);
-    unweighted_residual.y() =
-        y_ - (cos_source_theta * dy - sin_source_theta * dx);
-    unweighted_residual.z() = NormalizeAngleDifference(
+    Eigen::Map<Eigen::Vector3d> residual_map(residuals);
+    residual_map(0) = x_ - (cos_source_theta * dx + sin_source_theta * dy);
+    residual_map(1) = y_ - (cos_source_theta * dy - sin_source_theta * dx);
+    residual_map(2) = NormalizeAngleDifference(
         theta_ - (parameters[5][0] - parameters[2][0]));
-    Eigen::Vector3d residual_vector = sqrt_information_ * unweighted_residual;
+    residual_map = sqrt_information_ * residual_map;
 
-    residuals[0] = residual_vector.x();
-    residuals[1] = residual_vector.y();
-    residuals[2] = residual_vector.z();
     if (!jacobians) return true;
 
     double* jacobian_source_x = jacobians[0];
@@ -166,7 +168,70 @@ class SpaCostFunctorAnalytic
   const Eigen::Matrix3d sqrt_information_;
 };
 
-int main(void) {
+double Optimize(const std::vector<Constraint>& constraints,
+                std::map<int, Pose>& poses, bool use_analytic_cost) {
+  Eigen::Matrix3d information_matrix = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d sqrt_information = information_matrix.llt().matrixU();
+
+  ceres::Problem problem;
+  for (const auto& constraint : constraints) {
+    auto& source = poses[constraint.source];
+    auto& target = poses[constraint.target];
+    if (use_analytic_cost) {
+      problem.AddResidualBlock(new SpaCostFunctorAnalytic(
+                                   constraint.relative_pose, sqrt_information),
+                               new ceres::HuberLoss(1.0),
+                               &source.translation.x(), &source.translation.y(),
+                               &source.rotation.angle(),
+                               &target.translation.x(), &target.translation.y(),
+                               &target.rotation.angle());
+    } else {
+      problem.AddResidualBlock(
+          new ceres::AutoDiffCostFunction<SpaCostFunctor, 3, 1, 1, 1, 1, 1, 1>(
+              new SpaCostFunctor(constraint.relative_pose, sqrt_information)),
+          new ceres::HuberLoss(1.0), &source.translation.x(),
+          &source.translation.y(), &source.rotation.angle(),
+          &target.translation.x(), &target.translation.y(),
+          &target.rotation.angle());
+    }
+  }
+  auto& reference_pose = poses[0];
+  problem.SetParameterBlockConstant(&reference_pose.translation.x());
+  problem.SetParameterBlockConstant(&reference_pose.translation.y());
+  problem.SetParameterBlockConstant(&reference_pose.rotation.angle());
+  ceres::Solver::Options options;
+  ceres::Solver::Summary summary;
+  options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+
+  bool verbose = false;
+  ceres::Solve(options, &problem, &summary);
+  if (verbose) {
+    std::cout << "used "
+              << (use_analytic_cost ? "analytic cost\n" : "autodiff cost\n");
+    std::cout << "total time: " << summary.total_time_in_seconds << std::endl;
+    std::cout << "num residuals: " << summary.num_residuals << std::endl;
+    std::cout << "num parameters: " << summary.num_parameters << std::endl;
+    std::cout << "num effective parameters: "
+              << summary.num_effective_parameters << std::endl;
+    std::cout << "num successful steps: " << summary.num_successful_steps
+              << std::endl;
+    std::cout << "initial/final costs: " << summary.initial_cost << ", "
+              << summary.final_cost << std::endl;
+  }
+
+  bool print_output = false;
+  if (print_output) {
+    for (const auto& pair : poses) {
+      const auto& pose = pair.second;
+      std::cout << "Pose " << pair.first << " is " << pose.translation.x()
+                << ", " << pose.translation.y() << ", " << pose.rotation.angle()
+                << std::endl;
+    }
+  }
+  return summary.total_time_in_seconds;
+}
+
+double run(bool use_anayltic_cost) {
   Constraint constraint01, constraint12, constraint20;
   constraint01.source = 0;
   constraint01.target = 1;
@@ -201,62 +266,35 @@ int main(void) {
   poses[1] = p1;
   poses[2] = p2;
 
-  Eigen::Matrix3d information_matrix = Eigen::Matrix3d::Identity();
-  Eigen::Matrix3d sqrt_information = information_matrix.llt().matrixU();
+  return Optimize(constraints, poses, use_anayltic_cost);
+}
 
-  ceres::Problem problem;
-  bool use_analytic_cost = true;
-  for (const auto& constraint : constraints) {
-    auto& source = poses[constraint.source];
-    auto& target = poses[constraint.target];
-    if (use_analytic_cost) {
-      problem.AddResidualBlock(new SpaCostFunctorAnalytic(
-                                   constraint.relative_pose, sqrt_information),
-                               new ceres::HuberLoss(1.0),
-                               &source.translation.x(), &source.translation.y(),
-                               &source.rotation.angle(),
-                               &target.translation.x(), &target.translation.y(),
-                               &target.rotation.angle());
-    } else {
-      problem.AddResidualBlock(
-          new ceres::AutoDiffCostFunction<SpaCostFunctor, 3, 1, 1, 1, 1, 1, 1>(
-              new SpaCostFunctor(constraint.relative_pose)),
-          new ceres::HuberLoss(1.0), &source.translation.x(),
-          &source.translation.y(), &source.rotation.angle(),
-          &target.translation.x(), &target.translation.y(),
-          &target.rotation.angle());
-    }
-  }
-  auto& reference_pose = poses[0];
-  problem.SetParameterBlockConstant(&reference_pose.translation.x());
-  problem.SetParameterBlockConstant(&reference_pose.translation.y());
-  problem.SetParameterBlockConstant(&reference_pose.rotation.angle());
-  ceres::Solver::Options options;
-  ceres::Solver::Summary summary;
-  options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+int main(void) {
+  int num_iterations = 1000;
+  double mean_time_auto, max_time_auto;
+  mean_time_auto = max_time_auto = 0.0;
+  double mean_time_anal, max_time_anal;
+  mean_time_anal = max_time_anal = 0.0;
 
-  bool verbose = true;
-  ceres::Solve(options, &problem, &summary);
-  if (verbose) {
-    std::cout << "used "
-              << (use_analytic_cost ? "analytic cost\n" : "autodiff cost\n");
-    std::cout << "total time: " << summary.total_time_in_seconds << std::endl;
-    std::cout << "num residuals: " << summary.num_residuals << std::endl;
-    std::cout << "num parameters: " << summary.num_parameters << std::endl;
-    std::cout << "num effective parameters: "
-              << summary.num_effective_parameters << std::endl;
-    std::cout << "num successful steps: " << summary.num_successful_steps
-              << std::endl;
-    std::cout << "initial/final costs: " << summary.initial_cost << ", "
-              << summary.final_cost << std::endl;
+  for (int i = 0; i < num_iterations; i++) {
+    double run_time = run(false);
+    if (run_time > max_time_auto) max_time_auto = run_time;
+    mean_time_auto += run_time;
   }
+  mean_time_auto /= num_iterations;
 
-  for (const auto& pair : poses) {
-    const auto& pose = pair.second;
-    std::cout << "Pose " << pair.first << " is " << pose.translation.x() << ", "
-              << pose.translation.y() << ", " << pose.rotation.angle()
-              << std::endl;
+  for (int i = 0; i < num_iterations; i++) {
+    double run_time = run(true);
+    if (run_time > max_time_anal) max_time_anal = run_time;
+    mean_time_anal += run_time;
   }
+  mean_time_anal /= num_iterations;
+
+  std::cout << "Mean time auto: " << mean_time_auto << std::endl;
+  std::cout << "Max time auto: " << max_time_auto << std::endl;
+
+  std::cout << "Mean time anal: " << mean_time_anal << std::endl;
+  std::cout << "Max time anal: " << max_time_anal << std::endl;
 
   return 0;
 }
