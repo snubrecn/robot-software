@@ -54,60 +54,107 @@ class SpaCostFunctor {
 class SpaCostFunctorAnalytic
     : public ceres::SizedCostFunction<3, 1, 1, 1, 1, 1, 1> {
  public:
-  SpaCostFunctorAnalytic(const Pose& observed)
+  SpaCostFunctorAnalytic(const Pose& observed,
+                         const Eigen::Matrix3d& sqrt_information)
       : x_(observed.translation.x()),
         y_(observed.translation.y()),
-        theta_(observed.rotation.angle()) {}
+        theta_(observed.rotation.angle()),
+        sqrt_information_(sqrt_information) {}
   virtual ~SpaCostFunctorAnalytic() {}
 
   bool Evaluate(const double* const* parameters, double* residuals,
                 double** jacobians) const {
-    const double source_cos = cos(parameters[2][0]);
-    const double source_sin = sin(parameters[2][0]);
-    const double delta_x = parameters[3][0] - parameters[0][0];
-    const double delta_y = parameters[4][0] - parameters[1][0];
+    const double cos_source_theta = cos(parameters[2][0]);
+    const double sin_source_theta = sin(parameters[2][0]);
+    const double dx = parameters[3][0] - parameters[0][0];
+    const double dy = parameters[4][0] - parameters[1][0];
 
-    residuals[0] = x_ - (source_cos * delta_x + source_sin * delta_y);
-    residuals[1] = y_ - (source_cos * delta_y - source_sin * delta_x);
-    residuals[2] = NormalizeAngleDifference(
+    Eigen::Vector3d unweighted_residual;
+    unweighted_residual.x() =
+        x_ - (cos_source_theta * dx + sin_source_theta * dy);
+    unweighted_residual.y() =
+        y_ - (cos_source_theta * dy - sin_source_theta * dx);
+    unweighted_residual.z() = NormalizeAngleDifference(
         theta_ - (parameters[5][0] - parameters[2][0]));
+    Eigen::Vector3d residual_vector = sqrt_information_ * unweighted_residual;
+
+    residuals[0] = residual_vector.x();
+    residuals[1] = residual_vector.y();
+    residuals[2] = residual_vector.z();
     if (!jacobians) return true;
 
-    double* grad_source_x = jacobians[0];
-    double* grad_source_y = jacobians[1];
-    double* grad_source_theta = jacobians[2];
-    double* grad_target_x = jacobians[3];
-    double* grad_target_y = jacobians[4];
-    double* grad_target_theta = jacobians[5];
+    double* jacobian_source_x = jacobians[0];
+    double* jacobian_source_y = jacobians[1];
+    double* jacobian_source_theta = jacobians[2];
+    double* jacobian_target_x = jacobians[3];
+    double* jacobian_target_y = jacobians[4];
+    double* jacobian_target_theta = jacobians[5];
 
-    if (grad_source_x) {
-      grad_source_x[0] = source_cos;
-      grad_source_x[1] = -source_sin;
-      grad_source_x[2] = 0;
+    // Some sub-expressions
+    const double unweighted_jacobians_02 =
+        sin_source_theta * dx - cos_source_theta * dy;
+    const double unweighted_jacobians_12 =
+        cos_source_theta * dx + sin_source_theta * dy;
+
+    if (jacobian_source_x) {
+      jacobian_source_x[0] = sqrt_information_(0, 0) * cos_source_theta -
+                             sqrt_information_(0, 1) * sin_source_theta;
+      jacobian_source_x[1] = sqrt_information_(1, 0) * cos_source_theta -
+                             sqrt_information_(1, 1) * sin_source_theta;
+      jacobian_source_x[2] = sqrt_information_(2, 0) * cos_source_theta -
+                             sqrt_information_(2, 1) * sin_source_theta;
     }
-    if (grad_source_y) {
-      grad_source_y[0] = source_sin;
-      grad_source_y[1] = source_cos;
-      grad_source_y[2] = 0;
+    if (jacobian_source_y) {
+      jacobian_source_y[0] = sqrt_information_(0, 0) * sin_source_theta +
+                             sqrt_information_(0, 1) * cos_source_theta;
+      jacobian_source_y[1] = sqrt_information_(1, 0) * sin_source_theta +
+                             sqrt_information_(1, 1) * cos_source_theta;
+      jacobian_source_y[2] = sqrt_information_(2, 0) * sin_source_theta +
+                             sqrt_information_(2, 2) * cos_source_theta;
     }
-    if (grad_source_theta) {
-      grad_source_theta[0] = source_sin * delta_x - source_cos * delta_y;
-      grad_source_theta[1] = source_cos * delta_x + source_sin * delta_y;
-      grad_source_theta[2] = 1;
+    if (jacobian_source_theta) {
+      jacobian_source_theta[0] =
+          sqrt_information_(0, 0) * unweighted_jacobians_02 +
+          sqrt_information_(0, 1) * unweighted_jacobians_12;
+      jacobian_source_theta[1] =
+          sqrt_information_(1, 0) * unweighted_jacobians_02 +
+          sqrt_information_(1, 1) * unweighted_jacobians_12;
+      jacobian_source_theta[2] =
+          sqrt_information_(2, 0) * unweighted_jacobians_02 +
+          sqrt_information_(2, 1) * unweighted_jacobians_12;
     }
-    if (grad_target_x) {
-      grad_target_x[0] = -source_cos;
-      grad_target_x[1] = source_sin;
-      grad_target_x[2] = 0;
+    if (jacobian_target_x) {
+      if (jacobian_source_x) {
+        jacobian_target_x[0] = -jacobian_source_x[0];
+        jacobian_target_x[1] = -jacobian_source_x[1];
+        jacobian_target_x[2] = -jacobian_source_x[2];
+      } else {
+        jacobian_target_x[0] = sqrt_information_(0, 1) * sin_source_theta -
+                               sqrt_information_(0, 0) * cos_source_theta;
+        jacobian_target_x[1] = sqrt_information_(1, 1) * sin_source_theta -
+                               sqrt_information_(1, 0) * cos_source_theta;
+        jacobian_target_x[2] = sqrt_information_(2, 1) * sin_source_theta -
+                               sqrt_information_(2, 0) * cos_source_theta;
+      }
     }
-    if (grad_target_y) {
-      grad_target_y[0] = -source_sin;
-      grad_target_y[1] = -source_cos;
-      grad_target_y[2] = 0;
+    if (jacobian_target_y) {
+      if (jacobian_source_y) {
+        jacobian_target_y[0] = -jacobian_source_y[0];
+        jacobian_target_y[1] = -jacobian_source_y[1];
+        jacobian_target_y[2] = -jacobian_source_y[2];
+      } else {
+        jacobian_target_y[0] = -sqrt_information_(0, 0) * sin_source_theta -
+                               sqrt_information_(0, 1) * cos_source_theta;
+        jacobian_target_y[1] = -sqrt_information_(1, 0) * sin_source_theta -
+                               sqrt_information_(1, 1) * cos_source_theta;
+        jacobian_target_y[2] = -sqrt_information_(2, 0) * sin_source_theta -
+                               sqrt_information_(2, 1) * cos_source_theta;
+      }
     }
-    if (grad_target_theta) {
-      grad_target_theta[0] = grad_target_theta[1] = 0;
-      grad_target_theta[2] = -1;
+    if (jacobian_target_theta) {
+      jacobian_target_theta[0] = -sqrt_information_(0, 2);
+      jacobian_target_theta[1] = -sqrt_information_(1, 2);
+      jacobian_target_theta[2] = -sqrt_information_(2, 2);
     }
     return true;
   }
@@ -116,6 +163,7 @@ class SpaCostFunctorAnalytic
   const double x_;
   const double y_;
   const double theta_;
+  const Eigen::Matrix3d sqrt_information_;
 };
 
 int main(void) {
@@ -153,18 +201,22 @@ int main(void) {
   poses[1] = p1;
   poses[2] = p2;
 
+  Eigen::Matrix3d information_matrix = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d sqrt_information = information_matrix.llt().matrixU();
+
   ceres::Problem problem;
   bool use_analytic_cost = true;
   for (const auto& constraint : constraints) {
     auto& source = poses[constraint.source];
     auto& target = poses[constraint.target];
     if (use_analytic_cost) {
-      problem.AddResidualBlock(
-          new SpaCostFunctorAnalytic(constraint.relative_pose),
-          new ceres::HuberLoss(1.0), &source.translation.x(),
-          &source.translation.y(), &source.rotation.angle(),
-          &target.translation.x(), &target.translation.y(),
-          &target.rotation.angle());
+      problem.AddResidualBlock(new SpaCostFunctorAnalytic(
+                                   constraint.relative_pose, sqrt_information),
+                               new ceres::HuberLoss(1.0),
+                               &source.translation.x(), &source.translation.y(),
+                               &source.rotation.angle(),
+                               &target.translation.x(), &target.translation.y(),
+                               &target.rotation.angle());
     } else {
       problem.AddResidualBlock(
           new ceres::AutoDiffCostFunction<SpaCostFunctor, 3, 1, 1, 1, 1, 1, 1>(
